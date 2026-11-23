@@ -18,6 +18,10 @@ export class AudioEngine {
 
   private rainGain: GainNode | null = null;
   private skidGain: GainNode | null = null;
+  private rotorChopOsc: OscillatorNode | null = null;
+  private rotorChopGain: GainNode | null = null;
+  private rotorCarrierOsc: OscillatorNode | null = null;
+  private rotorSubGain: GainNode | null = null;
 
   private musicTimer: number | null = null;
   private musicStep = 0;
@@ -96,6 +100,33 @@ export class AudioEngine {
     }
     this.engineOsc1.start();
     this.engineOsc2.start();
+
+    // Helicopter rotor blade slap LFO + turbine carrier
+    this.rotorCarrierOsc = ctx.createOscillator();
+    this.rotorChopOsc = ctx.createOscillator();
+    this.rotorChopGain = ctx.createGain();
+    this.rotorSubGain = ctx.createGain();
+
+    this.rotorCarrierOsc.type = 'sawtooth';
+    this.rotorCarrierOsc.frequency.value = 52;
+    this.rotorChopOsc.type = 'sine';
+    this.rotorChopOsc.frequency.value = 14;
+    this.rotorChopGain.gain.value = 0.12;
+    this.rotorSubGain.gain.value = 0;
+
+    const rotorFilter = ctx.createBiquadFilter();
+    rotorFilter.type = 'lowpass';
+    rotorFilter.frequency.value = 210;
+
+    this.rotorCarrierOsc.connect(rotorFilter);
+    rotorFilter.connect(this.rotorSubGain);
+    this.rotorChopOsc.connect(this.rotorChopGain);
+    this.rotorChopGain.connect(this.rotorSubGain.gain);
+    if (this.engineGain) {
+      this.rotorSubGain.connect(this.engineGain);
+    }
+    this.rotorCarrierOsc.start();
+    this.rotorChopOsc.start();
   }
 
   private setupSirenSynth(ctx: AudioContext): void {
@@ -210,7 +241,8 @@ export class AudioEngine {
     rpmNorm: number,
     throttle: boolean,
     gear: number,
-    skidIntensity: number
+    skidIntensity: number,
+    heliRotorRpm = 0
   ): void {
     if (!this.ctx || !this.engineOsc1 || !this.engineOsc2 || !this.engineFilter || !this.engineSubGain) {
       return;
@@ -218,10 +250,37 @@ export class AudioEngine {
     const now = this.ctx.currentTime;
     if (!active || profile === 'silent') {
       this.engineSubGain.gain.setTargetAtTime(0, now, 0.08);
+      this.rotorSubGain?.gain.setTargetAtTime(0, now, 0.08);
       this.skidGain?.gain.setTargetAtTime(0, now, 0.06);
       this.lastGear = 1;
       return;
     }
+
+    if (profile === 'helicopter') {
+      this.skidGain?.gain.setTargetAtTime(0, now, 0.06);
+      if (heliRotorRpm <= 0.02) {
+        this.engineSubGain.gain.setTargetAtTime(0, now, 0.1);
+        this.rotorSubGain?.gain.setTargetAtTime(0, now, 0.1);
+        return;
+      }
+      // Spooling turbine + pulsing blade chop
+      this.engineOsc1.type = 'triangle';
+      this.engineOsc2.type = 'sine';
+      this.engineOsc1.frequency.setTargetAtTime(85 + heliRotorRpm * 210 + (throttle ? 35 : 0), now, 0.06);
+      this.engineOsc2.frequency.setTargetAtTime(170 + heliRotorRpm * 420, now, 0.06);
+      this.engineFilter.frequency.setTargetAtTime(320 + heliRotorRpm * 520, now, 0.06);
+      this.engineSubGain.gain.setTargetAtTime(0.08 * heliRotorRpm, now, 0.08);
+
+      if (this.rotorCarrierOsc && this.rotorChopOsc && this.rotorSubGain && this.rotorChopGain) {
+        this.rotorCarrierOsc.frequency.setTargetAtTime(36 + heliRotorRpm * 28, now, 0.06);
+        this.rotorChopOsc.frequency.setTargetAtTime(4.5 + heliRotorRpm * 14.5, now, 0.06);
+        this.rotorChopGain.gain.setTargetAtTime(0.18 * heliRotorRpm, now, 0.06);
+        this.rotorSubGain.gain.setTargetAtTime(0.24 * heliRotorRpm, now, 0.08);
+      }
+      return;
+    }
+
+    this.rotorSubGain?.gain.setTargetAtTime(0, now, 0.08);
 
     if (gear > this.lastGear && gear > 1) {
       this.playGearShift();
@@ -289,14 +348,6 @@ export class AudioEngine {
         wave2 = 'triangle';
         filterHz = 1400;
         vol = 0.18;
-        break;
-      case 'helicopter':
-        baseHz = 14;
-        maxHz = 28;
-        wave1 = 'square';
-        wave2 = 'sawtooth';
-        filterHz = 190;
-        vol = 0.36;
         break;
       case 'plane':
         baseHz = 95;

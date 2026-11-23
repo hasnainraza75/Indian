@@ -1322,6 +1322,27 @@ export const VEHICLES: VehicleDef[] = [
     wheelRadius: 0.55
   },
   {
+    id: 'city_bus',
+    name: 'Mumbai BEST Bus',
+    category: 'heavy',
+    price: 22000,
+    topSpeedKmh: 112,
+    acceleration: 15,
+    handling: 1.85,
+    braking: 28,
+    suspensionStiffness: 0.78,
+    maxFuel: 100,
+    maxHealth: 780,
+    primaryColor: '#DC2626',
+    accentColor: '#FACC15',
+    soundProfile: 'diesel',
+    modelShape: 'bus',
+    length: 8.6,
+    width: 2.55,
+    height: 3.25,
+    wheelRadius: 0.56
+  },
+  {
     id: 'jcb',
     name: 'JCB Excavator Loader',
     category: 'heavy',

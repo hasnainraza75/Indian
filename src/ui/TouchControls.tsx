@@ -8,6 +8,7 @@ import {
   Flame,
   Fuel,
   RotateCw,
+  RotateCcw,
   Shield,
   Volume2,
   Zap,
@@ -22,7 +23,12 @@ import {
   ChevronDown,
   Wrench,
   ShoppingBag,
-  Flag
+  Flag,
+  Video,
+  ZoomIn,
+  ZoomOut,
+  Power,
+  Navigation
 } from 'lucide-react';
 import { ControlInputBridge } from '../game/GameEngine';
 import { HudSnapshot, SteeringMode } from '../game/types';
@@ -34,6 +40,11 @@ interface TouchControlsProps {
   onInput: (patch: Partial<ControlInputBridge>) => void;
   onCameraDrag: (dx: number, dy: number) => void;
   onCameraEnd: () => void;
+  onCycleCamera: () => void;
+  onZoomCamera: (delta: number) => void;
+  onToggleHeliEngine: () => void;
+  onToggleHeliHover: () => void;
+  onTriggerHeliLand: () => void;
   onEnterExit: () => void;
   onHorn: () => void;
   onReload: () => void;
@@ -53,6 +64,11 @@ export const TouchControls: React.FC<TouchControlsProps> = ({
   onInput,
   onCameraDrag,
   onCameraEnd,
+  onCycleCamera,
+  onZoomCamera,
+  onToggleHeliEngine,
+  onToggleHeliHover,
+  onTriggerHeliLand,
   onEnterExit,
   onHorn,
   onReload,
@@ -90,7 +106,9 @@ export const TouchControls: React.FC<TouchControlsProps> = ({
     if (joyPointerId.current !== e.pointerId) return;
     joyPointerId.current = null;
     setJoyKnob({ x: 0, y: 0 });
-    if (hud.inVehicle) {
+    if (hud.isHelicopter) {
+      onInput({ heliCyclicX: 0, heliCyclicY: 0 });
+    } else if (hud.inVehicle) {
       onInput({ steer: 0 });
     } else {
       onInput({ moveX: 0, moveY: 0 });
@@ -110,7 +128,9 @@ export const TouchControls: React.FC<TouchControlsProps> = ({
 
     const nx = kx / maxR;
     const ny = -ky / maxR;
-    if (hud.inVehicle) {
+    if (hud.isHelicopter) {
+      onInput({ heliCyclicX: nx, heliCyclicY: ny });
+    } else if (hud.inVehicle) {
       onInput({ steer: nx });
     } else {
       onInput({ moveX: nx, moveY: ny, sprint: sprintOn || dist > maxR * 0.85 });
@@ -143,6 +163,8 @@ export const TouchControls: React.FC<TouchControlsProps> = ({
   )
     .toString()
     .padStart(2, '0')}`;
+
+  const camLabel = hud.cameraMode === 'first_person' ? '1P' : hud.cameraMode === 'far' ? 'FAR' : '3P';
 
   return (
     <div style={{ position: 'fixed', inset: 0, zIndex: 10, pointerEvents: 'none' }}>
@@ -293,7 +315,7 @@ export const TouchControls: React.FC<TouchControlsProps> = ({
         )}
       </div>
 
-      {/* TOP RIGHT HUD: Money, Minimap, Phone & Pause */}
+      {/* TOP RIGHT HUD: Money, Minimap, Camera, Phone & Pause */}
       <div
         style={{
           position: 'absolute',
@@ -322,14 +344,26 @@ export const TouchControls: React.FC<TouchControlsProps> = ({
           </div>
 
           <div style={{ display: 'flex', gap: 6 }}>
-            <CircleHudBtn onClick={onOpenPhone} label="Mobile Phone" bg="rgba(14, 165, 233, 0.85)">
-              <Phone size={18} />
+            <CircleHudBtn onClick={onCycleCamera} label={`Camera (${camLabel})`} bg="rgba(51, 65, 85, 0.9)" size={40}>
+              <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', lineHeight: 1 }}>
+                <Video size={13} />
+                <span style={{ fontSize: 8, fontWeight: 900, marginTop: 1 }}>{camLabel}</span>
+              </div>
             </CircleHudBtn>
-            <CircleHudBtn onClick={onOpenMap} label="World Map" bg="rgba(30, 41, 59, 0.88)">
-              <MapPin size={18} />
+            <CircleHudBtn onClick={() => onZoomCamera(-1.2)} label="Zoom In" bg="rgba(30, 41, 59, 0.88)" size={40}>
+              <ZoomIn size={16} />
             </CircleHudBtn>
-            <CircleHudBtn onClick={onOpenPause} label="Pause Menu" bg="rgba(30, 41, 59, 0.88)">
-              <Pause size={18} />
+            <CircleHudBtn onClick={() => onZoomCamera(1.2)} label="Zoom Out" bg="rgba(30, 41, 59, 0.88)" size={40}>
+              <ZoomOut size={16} />
+            </CircleHudBtn>
+            <CircleHudBtn onClick={onOpenPhone} label="Mobile Phone" bg="rgba(14, 165, 233, 0.85)" size={40}>
+              <Phone size={17} />
+            </CircleHudBtn>
+            <CircleHudBtn onClick={onOpenMap} label="World Map" bg="rgba(30, 41, 59, 0.88)" size={40}>
+              <MapPin size={17} />
+            </CircleHudBtn>
+            <CircleHudBtn onClick={onOpenPause} label="Pause Menu" bg="rgba(30, 41, 59, 0.88)" size={40}>
+              <Pause size={17} />
             </CircleHudBtn>
           </div>
         </div>
@@ -399,7 +433,7 @@ export const TouchControls: React.FC<TouchControlsProps> = ({
       <div
         style={{
           position: 'absolute',
-          bottom: 132,
+          bottom: 138,
           left: '50%',
           transform: 'translateX(-50%)',
           display: 'flex',
@@ -449,16 +483,20 @@ export const TouchControls: React.FC<TouchControlsProps> = ({
         )}
       </div>
 
-      {/* BOTTOM LEFT: JOYSTICK OR STEERING BUTTONS */}
+      {/* BOTTOM LEFT: JOYSTICK (ON-FOOT / HELI CYCLIC / STEERING) OR STEERING BUTTONS */}
       <div
         style={{
           position: 'absolute',
           bottom: 18,
           left: 18,
+          display: 'flex',
+          flexDirection: 'column',
+          alignItems: 'center',
+          gap: 4,
           pointerEvents: 'auto'
         }}
       >
-        {hud.inVehicle && steeringMode === 'buttons' ? (
+        {hud.inVehicle && !hud.isHelicopter && steeringMode === 'buttons' ? (
           <div style={{ display: 'flex', gap: 14, alignItems: 'center' }}>
             <HoldControlBtn
               label="Steer Left"
@@ -478,40 +516,229 @@ export const TouchControls: React.FC<TouchControlsProps> = ({
             </HoldControlBtn>
           </div>
         ) : (
-          <div
-            className="touch-none"
-            onPointerDown={handleJoyDown}
-            onPointerMove={handleJoyMove}
-            onPointerUp={handleJoyUp}
-            onPointerCancel={handleJoyUp}
-            style={{
-              width: 122,
-              height: 122,
-              borderRadius: '50%',
-              background: 'rgba(15, 23, 42, 0.55)',
-              border: '2px solid rgba(148, 163, 184, 0.35)',
-              position: 'relative',
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'center'
-            }}
-          >
+          <>
+            {hud.isHelicopter && (
+              <span style={{ fontSize: 9, fontWeight: 900, color: '#38BDF8', letterSpacing: 0.8 }}>
+                FLIGHT STICK (FWD / BACK / L / R)
+              </span>
+            )}
             <div
+              className="touch-none"
+              onPointerDown={handleJoyDown}
+              onPointerMove={handleJoyMove}
+              onPointerUp={handleJoyUp}
+              onPointerCancel={handleJoyUp}
               style={{
-                width: 50,
-                height: 50,
+                width: 122,
+                height: 122,
                 borderRadius: '50%',
-                background: 'linear-gradient(135deg, #38BDF8, #0284C7)',
-                boxShadow: '0 4px 14px rgba(56, 189, 248, 0.45)',
-                transform: `translate(${joyKnob.x}px, ${joyKnob.y}px)`
+                background: 'rgba(15, 23, 42, 0.55)',
+                border: hud.isHelicopter ? '2px solid rgba(56, 189, 248, 0.6)' : '2px solid rgba(148, 163, 184, 0.35)',
+                position: 'relative',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center'
               }}
-            />
-          </div>
+            >
+              <div
+                style={{
+                  width: 50,
+                  height: 50,
+                  borderRadius: '50%',
+                  background: hud.isHelicopter
+                    ? 'linear-gradient(135deg, #22D3EE, #0284C7)'
+                    : 'linear-gradient(135deg, #38BDF8, #0284C7)',
+                  boxShadow: '0 4px 14px rgba(56, 189, 248, 0.45)',
+                  transform: `translate(${joyKnob.x}px, ${joyKnob.y}px)`
+                }}
+              />
+            </div>
+          </>
         )}
       </div>
 
-      {/* BOTTOM RIGHT: VEHICLE CONTROLS + SPEEDOMETER OR ON-FOOT COMBAT CONTROLS */}
-      {hud.inVehicle ? (
+      {/* BOTTOM RIGHT: HELICOPTER FLIGHT CONTROLS / VEHICLE CONTROLS / ON-FOOT CONTROLS */}
+      {hud.isHelicopter ? (
+        <div
+          style={{
+            position: 'absolute',
+            bottom: 14,
+            right: 16,
+            display: 'flex',
+            alignItems: 'flex-end',
+            gap: 10,
+            pointerEvents: 'auto'
+          }}
+        >
+          {/* Helicopter Flight Instrumentation HUD */}
+          <div
+            className="glass-panel"
+            style={{
+              padding: '8px 12px',
+              borderRadius: 14,
+              minWidth: 152,
+              display: 'flex',
+              flexDirection: 'column',
+              gap: 4,
+              border: '1px solid rgba(56, 189, 248, 0.35)'
+            }}
+          >
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8 }}>
+              <div>
+                <div style={{ fontSize: 9, fontWeight: 800, color: '#94A3B8' }}>ALTITUDE</div>
+                <div style={{ fontFamily: 'monospace', fontSize: 20, fontWeight: 900, color: '#38BDF8', lineHeight: 1.05 }}>
+                  {hud.altitudeM}m
+                </div>
+              </div>
+              <div style={{ textAlign: 'right' }}>
+                <div style={{ fontSize: 9, fontWeight: 800, color: '#94A3B8' }}>AIRSPEED</div>
+                <div style={{ fontFamily: 'monospace', fontSize: 20, fontWeight: 900, color: '#4ADE80', lineHeight: 1.05 }}>
+                  {hud.airspeedKmh}
+                  <span style={{ fontSize: 9, marginLeft: 2 }}>KM/H</span>
+                </div>
+              </div>
+            </div>
+
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: 10, fontWeight: 800 }}>
+              <span style={{ color: '#F8FAFC' }}>{hud.vehicleName}</span>
+              <span style={{ color: hud.heliEngineOn ? '#4ADE80' : '#F87171' }}>
+                {hud.heliEngineOn ? 'ENG ON' : 'ENG OFF'}
+              </span>
+            </div>
+
+            <div style={{ display: 'flex', gap: 6, alignItems: 'center', fontSize: 9, color: '#94A3B8' }}>
+              <span>ROTOR</span>
+              <div style={{ flex: 1, height: 5, background: '#1E293B', borderRadius: 3 }}>
+                <div
+                  style={{
+                    width: `${Math.round(hud.heliRotorRpm * 100)}%`,
+                    height: '100%',
+                    background: hud.heliRotorRpm > 0.7 ? '#22C55E' : '#FACC15',
+                    borderRadius: 3
+                  }}
+                />
+              </div>
+              <span style={{ fontFamily: 'monospace', color: '#E2E8F0' }}>{Math.round(hud.heliRotorRpm * 100)}%</span>
+            </div>
+
+            <div style={{ display: 'flex', gap: 6, alignItems: 'center', fontSize: 9, color: '#94A3B8' }}>
+              <span>FUEL</span>
+              <div style={{ flex: 1, height: 4, background: '#1E293B', borderRadius: 3 }}>
+                <div
+                  style={{
+                    width: `${(hud.fuel / Math.max(1, hud.maxFuel)) * 100}%`,
+                    height: '100%',
+                    background: hud.fuel < 20 ? '#EF4444' : '#FACC15',
+                    borderRadius: 3
+                  }}
+                />
+              </div>
+            </div>
+
+            <div style={{ display: 'flex', gap: 4, marginTop: 2 }}>
+              {hud.heliHover && (
+                <span style={{ fontSize: 8, fontWeight: 900, padding: '2px 5px', borderRadius: 4, background: '#0284C7', color: '#fff' }}>
+                  HOVER HOLD
+                </span>
+              )}
+              {hud.heliLanding && (
+                <span style={{ fontSize: 8, fontWeight: 900, padding: '2px 5px', borderRadius: 4, background: '#EA580C', color: '#fff' }}>
+                  LANDING
+                </span>
+              )}
+            </div>
+          </div>
+
+          {/* Right Helicopter Flight Buttons */}
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8, alignItems: 'flex-end' }}>
+            <div style={{ display: 'flex', gap: 7, alignItems: 'center' }}>
+              <CircleHudBtn
+                onClick={onToggleHeliEngine}
+                label={hud.heliEngineOn ? 'Stop Engine' : 'Start Engine'}
+                bg={hud.heliEngineOn ? 'rgba(34, 197, 94, 0.92)' : 'rgba(220, 38, 38, 0.88)'}
+                size={48}
+              >
+                <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', lineHeight: 1 }}>
+                  <Power size={15} />
+                  <span style={{ fontSize: 8, fontWeight: 900, marginTop: 1 }}>ENG</span>
+                </div>
+              </CircleHudBtn>
+              <CircleHudBtn
+                onClick={onToggleHeliHover}
+                label="Hover Toggle"
+                bg={hud.heliHover ? 'rgba(14, 165, 233, 0.92)' : 'rgba(51, 65, 85, 0.88)'}
+                size={48}
+              >
+                <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', lineHeight: 1 }}>
+                  <Navigation size={14} />
+                  <span style={{ fontSize: 8, fontWeight: 900, marginTop: 1 }}>HOVER</span>
+                </div>
+              </CircleHudBtn>
+              <CircleHudBtn
+                onClick={onTriggerHeliLand}
+                label="Auto Land"
+                bg={hud.heliLanding ? 'rgba(249, 115, 22, 0.92)' : 'rgba(71, 85, 105, 0.88)'}
+                size={48}
+              >
+                <span style={{ fontSize: 9, fontWeight: 900 }}>LAND</span>
+              </CircleHudBtn>
+              {hud.vehicleId === 'apache' && (
+                <HoldControlBtn
+                  label="Fire Cannon"
+                  size={48}
+                  bg="rgba(244, 63, 94, 0.88)"
+                  onHoldStart={() => onInput({ fire: true })}
+                  onHoldEnd={() => onInput({ fire: false })}
+                >
+                  <Crosshair size={20} />
+                </HoldControlBtn>
+              )}
+              <CircleHudBtn onClick={onEnterExit} label="Exit Helicopter" bg="rgba(239, 68, 68, 0.85)" size={48}>
+                <LogOut size={18} />
+              </CircleHudBtn>
+            </div>
+
+            <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+              <HoldControlBtn
+                label="Rotate Left"
+                size={54}
+                bg="rgba(30, 41, 59, 0.88)"
+                onHoldStart={() => onInput({ heliYaw: -1 })}
+                onHoldEnd={() => onInput({ heliYaw: 0 })}
+              >
+                <RotateCcw size={22} />
+              </HoldControlBtn>
+              <HoldControlBtn
+                label="Rotate Right"
+                size={54}
+                bg="rgba(30, 41, 59, 0.88)"
+                onHoldStart={() => onInput({ heliYaw: 1 })}
+                onHoldEnd={() => onInput({ heliYaw: 0 })}
+              >
+                <RotateCw size={22} />
+              </HoldControlBtn>
+              <HoldControlBtn
+                label="Descend"
+                size={58}
+                bg="rgba(234, 88, 12, 0.88)"
+                onHoldStart={() => onInput({ descend: true })}
+                onHoldEnd={() => onInput({ descend: false })}
+              >
+                <ChevronDown size={26} />
+              </HoldControlBtn>
+              <HoldControlBtn
+                label="Ascend"
+                size={68}
+                bg="rgba(14, 165, 233, 0.92)"
+                onHoldStart={() => onInput({ ascend: true })}
+                onHoldEnd={() => onInput({ ascend: false })}
+              >
+                <ChevronUp size={30} />
+              </HoldControlBtn>
+            </div>
+          </div>
+        </div>
+      ) : hud.inVehicle ? (
         <div
           style={{
             position: 'absolute',
@@ -529,7 +756,7 @@ export const TouchControls: React.FC<TouchControlsProps> = ({
             style={{
               padding: '8px 12px',
               borderRadius: 14,
-              minWidth: 132,
+              minWidth: 136,
               display: 'flex',
               flexDirection: 'column',
               gap: 4
@@ -539,8 +766,8 @@ export const TouchControls: React.FC<TouchControlsProps> = ({
               <span style={{ fontFamily: 'monospace', fontSize: 24, fontWeight: 900, color: '#38BDF8' }}>
                 {hud.speedKmh}
               </span>
-              <span style={{ fontSize: 10, fontWeight: 700, color: '#94A3B8' }}>
-                KM/H · G{hud.gear}
+              <span style={{ fontSize: 10, fontWeight: 800, color: hud.gear === 0 ? '#F97316' : '#94A3B8' }}>
+                KM/H · {hud.gear === 0 ? 'REV' : `G${hud.gear}`}
               </span>
             </div>
             <div style={{ fontSize: 10, fontWeight: 700, color: hud.isElectric ? '#22D3EE' : '#F8FAFC' }}>
@@ -599,7 +826,7 @@ export const TouchControls: React.FC<TouchControlsProps> = ({
                   </HoldControlBtn>
                 </>
               )}
-              {(hud.vehicleId === 'tank' || hud.vehicleId === 'apache') && (
+              {hud.vehicleId === 'tank' && (
                 <HoldControlBtn
                   label="Fire Cannon"
                   size={48}

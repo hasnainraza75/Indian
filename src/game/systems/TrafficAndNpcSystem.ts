@@ -1,6 +1,8 @@
+import RAPIER from '@dimforge/rapier3d-compat';
 import * as THREE from 'three';
 import { CharacterRig, createCharacterRig, createVehicleRig, VehicleRig } from '../entities/MeshFactory';
 import { VEHICLE_MAP } from '../data/vehiclesData';
+import { PhysicsWorld } from '../physics/PhysicsWorld';
 import { WorldBuilder } from '../world/WorldBuilder';
 
 export interface NpcPedestrian {
@@ -28,6 +30,10 @@ export interface TrafficUnit {
   laneAxis: 'x' | 'z';
   laneDir: 1 | -1;
   laneCoord: number;
+  width: number;
+  height: number;
+  length: number;
+  body?: RAPIER.RigidBody;
 }
 
 export class TrafficAndNpcSystem {
@@ -35,11 +41,22 @@ export class TrafficAndNpcSystem {
   readonly npcs: NpcPedestrian[] = [];
   readonly traffic: TrafficUnit[] = [];
 
+  private physics: PhysicsWorld | null = null;
   private maxNpcs = 18;
   private maxTraffic = 12;
 
-  constructor(scene: THREE.Scene) {
+  constructor(scene: THREE.Scene, physics?: PhysicsWorld) {
     this.scene = scene;
+    this.physics = physics ?? null;
+  }
+
+  setPhysicsWorld(physics: PhysicsWorld): void {
+    this.physics = physics;
+    for (const t of this.traffic) {
+      if (!t.body) {
+        t.body = physics.createKinematicTrafficBody(t.width, t.height, t.length, t.pos.x, t.pos.y, t.pos.z, t.rotY);
+      }
+    }
   }
 
   initPopulation(): void {
@@ -118,7 +135,18 @@ export class TrafficAndNpcSystem {
   }
 
   private spawnRandomTraffic(seedIdx: number): void {
-    const pool = ['innova', 'rickshaw', 'bolero', 'splendor', 'pulsar', 'truck', 'bmw', 'fortuner', 'scorpio_s11'];
+    const pool = [
+      'innova',
+      'rickshaw',
+      'bolero',
+      'splendor',
+      'pulsar',
+      'truck',
+      'city_bus',
+      'bmw',
+      'fortuner',
+      'scorpio_s11'
+    ];
     const def = VEHICLE_MAP[pool[seedIdx % pool.length]] ?? VEHICLE_MAP.innova;
     const lanes = [-90, 0, 90];
     const laneAxis: 'x' | 'z' = seedIdx % 2 === 0 ? 'x' : 'z';
@@ -142,16 +170,24 @@ export class TrafficAndNpcSystem {
     rig.group.rotation.y = rotY;
     this.scene.add(rig.group);
 
+    const body = this.physics
+      ? this.physics.createKinematicTrafficBody(def.width, def.height, def.length, x, 0, z, rotY)
+      : undefined;
+
     this.traffic.push({
       id: `traf_${seedIdx}_${Date.now()}`,
       rig,
       pos: new THREE.Vector3(x, 0, z),
       rotY,
       speed: 10 + Math.random() * 6,
-      maxSpeed: 12 + Math.random() * 6,
+      maxSpeed: def.id === 'city_bus' || def.id === 'truck' ? 11 + Math.random() * 3 : 12 + Math.random() * 6,
       laneAxis,
       laneDir,
-      laneCoord
+      laneCoord,
+      width: def.width,
+      height: def.height,
+      length: def.length,
+      body
     });
   }
 
@@ -179,7 +215,7 @@ export class TrafficAndNpcSystem {
       if (npc.health <= 0) {
         npc.deadTimer += dt;
         npc.rig.group.rotation.x = Math.PI / 2;
-        npc.rig.group.position.y = 0.25;
+        npc.rig.group.position.y = npc.pos.y + 0.25;
         if (npc.deadTimer > 4) {
           this.scene.remove(npc.rig.group);
           this.npcs.splice(i, 1);
@@ -190,7 +226,6 @@ export class TrafficAndNpcSystem {
 
       const distToPlayer = npc.pos.distanceTo(playerPos);
       if (distToPlayer > 260 && !npc.isHostile) {
-        // Recycle distant civilian NPC closer to player
         npc.pos.set(
           playerPos.x + (Math.random() - 0.5) * 140,
           0,
@@ -230,8 +265,14 @@ export class TrafficAndNpcSystem {
         }
       }
 
-      npc.pos.x = THREE.MathUtils.clamp(npc.pos.x + Math.sin(npc.rotY) * moveSpeed * dt, -420, 420);
-      npc.pos.z = THREE.MathUtils.clamp(npc.pos.z + Math.cos(npc.rotY) * moveSpeed * dt, -420, 420);
+      const nextX = THREE.MathUtils.clamp(npc.pos.x + Math.sin(npc.rotY) * moveSpeed * dt, -420, 420);
+      const nextZ = THREE.MathUtils.clamp(npc.pos.z + Math.cos(npc.rotY) * moveSpeed * dt, -420, 420);
+      const res = world.resolveHorizontalCollision(nextX, nextZ, npc.pos.y, 0.48, 1.75);
+      if (res.hit && !npc.isHostile) {
+        npc.rotY += Math.PI * 0.65;
+      }
+      npc.pos.x = res.x;
+      npc.pos.z = res.z;
       npc.pos.y = world.getGroundHeight(npc.pos.x, npc.pos.z, npc.pos.y);
 
       npc.rig.group.position.copy(npc.pos);
@@ -245,7 +286,7 @@ export class TrafficAndNpcSystem {
       npc.rig.rightArm.rotation.x = npc.isZombie ? -1.4 : npc.isHostile ? -1.35 : swing * 0.6;
     }
 
-    // Update Road Traffic
+    // Update Road Traffic & sync Kinematic Rapier bodies
     for (const t of this.traffic) {
       const stopForSignal = world.isSignalRedForDirection(t.pos.x, t.pos.z, t.laneAxis === 'z');
       const nearPlayer = t.pos.distanceTo(playerPos) < 9.5;
@@ -265,6 +306,10 @@ export class TrafficAndNpcSystem {
       t.rig.group.position.copy(t.pos);
       t.rig.group.rotation.y = t.rotY;
 
+      if (t.body && this.physics) {
+        this.physics.updateKinematicBody(t.body, t.pos.x, t.pos.y, t.pos.z, t.rotY);
+      }
+
       for (const w of t.rig.wheels) {
         w.rotation.x += t.speed * dt * 2.2;
       }
@@ -273,8 +318,12 @@ export class TrafficAndNpcSystem {
 
   clear(): void {
     for (const n of this.npcs) this.scene.remove(n.rig.group);
-    for (const t of this.traffic) this.scene.remove(t.rig.group);
+    for (const t of this.traffic) {
+      this.scene.remove(t.rig.group);
+      if (t.body && this.physics) this.physics.removeBody(t.body);
+    }
     this.npcs.length = 0;
     this.traffic.length = 0;
   }
 }
+

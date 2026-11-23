@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import { CharacterRig, createCharacterRig } from '../entities/MeshFactory';
+import { PhysicsWorld, RapierPlayerHandle } from '../physics/PhysicsWorld';
 import { CheatFlagKey, WeaponId } from '../types';
 import { WorldBuilder } from '../world/WorldBuilder';
 
@@ -13,7 +14,7 @@ export interface PlayerInputState {
 
 export class PlayerController {
   readonly rig: CharacterRig;
-  readonly pos = new THREE.Vector3(-130, 0.1, -116);
+  readonly pos = new THREE.Vector3(-130, 0.2, -116);
   readonly vel = new THREE.Vector3();
   rotY = 0;
   health = 100;
@@ -27,10 +28,38 @@ export class PlayerController {
   animTime = 0;
   attackAnimTimer = 0;
 
+  private physicsHandle: RapierPlayerHandle | null = null;
+
   constructor(scene: THREE.Scene) {
     this.rig = createCharacterRig('#F97316', '#1E293B', '#C68642', false, false);
     this.rig.group.position.copy(this.pos);
     scene.add(this.rig.group);
+  }
+
+  attachPhysics(physics: PhysicsWorld): void {
+    this.physicsHandle = physics.createPlayerController(this.pos.x, this.pos.y, this.pos.z);
+  }
+
+  setPosition(x: number, y: number, z: number): void {
+    this.pos.set(x, y, z);
+    this.vel.set(0, 0, 0);
+    if (this.physicsHandle) {
+      const offset = this.physicsHandle.capsuleCenterOffsetY;
+      this.physicsHandle.body.setTranslation({ x, y: y + offset, z }, true);
+      this.physicsHandle.body.setNextKinematicTranslation({ x, y: y + offset, z });
+    }
+    this.rig.group.position.copy(this.pos);
+  }
+
+  setInVehicle(inside: boolean): void {
+    this.inVehicle = inside;
+    if (this.physicsHandle) {
+      this.physicsHandle.collider.setEnabled(!inside);
+    }
+  }
+
+  setVisible(visible: boolean): void {
+    this.rig.group.visible = visible;
   }
 
   update(
@@ -47,7 +76,6 @@ export class PlayerController {
     }
 
     if (this.inVehicle) {
-      // Pose seated inside vehicle; GameEngine positions rig into vehicle seat
       this.animateSeated();
       return;
     }
@@ -69,7 +97,6 @@ export class PlayerController {
           : 6.4;
 
     if (inputMag > 0.08) {
-      // Convert stick input relative to camera yaw
       const forwardX = -Math.sin(cameraYaw);
       const forwardZ = -Math.cos(cameraYaw);
       const rightX = Math.cos(cameraYaw);
@@ -101,7 +128,6 @@ export class PlayerController {
       }
     }
 
-    // Jump + Cheat Super Jumps + Moon Gravity
     const gravity = activeCheats.moonGravity ? 6.5 : 22.0;
     if (input.jumpPressed && (this.isGrounded || this.isSwimming)) {
       const jumpPower = activeCheats.ultraSuperJump
@@ -114,63 +140,72 @@ export class PlayerController {
       this.isCrouching = false;
     }
 
-    this.vel.y -= gravity * dt;
-
-    // Proposed movement + AABB collision pushout
-    const nextX = THREE.MathUtils.clamp(this.pos.x + this.vel.x * dt, -460, 460);
-    const nextZ = THREE.MathUtils.clamp(this.pos.z + this.vel.z * dt, -460, 460);
-
-    let resolvedX = nextX;
-    let resolvedZ = nextZ;
-    const playerRadius = 0.52;
-
-    for (const c of world.colliders) {
-      if (this.pos.y >= c.maxY - 0.1) continue;
-      if (
-        resolvedX + playerRadius > c.minX &&
-        resolvedX - playerRadius < c.maxX &&
-        resolvedZ + playerRadius > c.minZ &&
-        resolvedZ - playerRadius < c.maxZ
-      ) {
-        const penLeft = Math.abs(resolvedX + playerRadius - c.minX);
-        const penRight = Math.abs(c.maxX - (resolvedX - playerRadius));
-        const penTop = Math.abs(resolvedZ + playerRadius - c.minZ);
-        const penBottom = Math.abs(c.maxZ - (resolvedZ - playerRadius));
-        const minPen = Math.min(penLeft, penRight, penTop, penBottom);
-        if (minPen === penLeft) resolvedX = c.minX - playerRadius;
-        else if (minPen === penRight) resolvedX = c.maxX + playerRadius;
-        else if (minPen === penTop) resolvedZ = c.minZ - playerRadius;
-        else resolvedZ = c.maxZ + playerRadius;
-      }
+    if (this.isSwimming) {
+      this.vel.y = Math.max(-1.5, this.vel.y - gravity * 0.2 * dt);
+    } else {
+      this.vel.y -= gravity * dt;
     }
 
-    this.pos.x = resolvedX;
-    this.pos.z = resolvedZ;
-    this.pos.y += this.vel.y * dt;
+    if (this.physicsHandle) {
+      const { body, collider, controller, capsuleCenterOffsetY } = this.physicsHandle;
+      // Disable snap to ground while jumping upward
+      if (this.vel.y > 0.5) {
+        controller.disableSnapToGround();
+      } else {
+        controller.enableSnapToGround(0.28);
+      }
 
-    const groundH = world.getGroundHeight(this.pos.x, this.pos.z, this.pos.y);
-    if (this.isSwimming && groundH < -0.1) {
-      if (this.pos.y < -0.2) {
-        this.pos.y = -0.2;
+      const desiredDelta = {
+        x: this.vel.x * dt,
+        y: this.vel.y * dt,
+        z: this.vel.z * dt
+      };
+
+      controller.computeColliderMovement(collider, desiredDelta);
+      const corrected = controller.computedMovement();
+      const prevY = this.vel.y;
+      const t = body.translation();
+
+      let nextCenterX = THREE.MathUtils.clamp(t.x + corrected.x, -460, 460);
+      let nextCenterY = t.y + corrected.y;
+      let nextCenterZ = THREE.MathUtils.clamp(t.z + corrected.z, -460, 460);
+
+      const feetY = nextCenterY - capsuleCenterOffsetY;
+
+      if (this.isSwimming && feetY < -0.22) {
+        nextCenterY = -0.22 + capsuleCenterOffsetY;
         this.vel.y = Math.max(0, this.vel.y);
+        this.isGrounded = true;
+      } else {
+        const grounded = controller.computedGrounded() && this.vel.y <= 0.1;
+        if (grounded) {
+          if (
+            prevY < -19 &&
+            !activeCheats.infinityHealth &&
+            !activeCheats.superJump &&
+            !activeCheats.ultraSuperJump
+          ) {
+            const fallDmg = Math.min(45, (-prevY - 18) * 3.5);
+            this.applyDamage(fallDmg);
+          }
+          this.vel.y = 0;
+        }
+        this.isGrounded = grounded;
       }
-      this.isGrounded = true;
-    } else if (this.pos.y <= groundH) {
-      // Fall damage if falling fast without infinity health or super jump
-      if (
-        this.vel.y < -19 &&
-        !activeCheats.infinityHealth &&
-        !activeCheats.superJump &&
-        !activeCheats.ultraSuperJump
-      ) {
-        const fallDmg = Math.min(45, (-this.vel.y - 18) * 3.5);
-        this.applyDamage(fallDmg);
-      }
-      this.pos.y = groundH;
-      this.vel.y = 0;
-      this.isGrounded = true;
+
+      body.setNextKinematicTranslation({ x: nextCenterX, y: nextCenterY, z: nextCenterZ });
+      this.pos.set(nextCenterX, nextCenterY - capsuleCenterOffsetY, nextCenterZ);
     } else {
-      this.isGrounded = false;
+      // Fallback if physics handle unavailable
+      this.pos.x = THREE.MathUtils.clamp(this.pos.x + this.vel.x * dt, -460, 460);
+      this.pos.z = THREE.MathUtils.clamp(this.pos.z + this.vel.z * dt, -460, 460);
+      this.pos.y += this.vel.y * dt;
+      const gh = world.getGroundHeight(this.pos.x, this.pos.z, this.pos.y);
+      if (this.pos.y <= gh) {
+        this.pos.y = gh;
+        this.vel.y = 0;
+        this.isGrounded = true;
+      }
     }
 
     this.rig.group.position.copy(this.pos);

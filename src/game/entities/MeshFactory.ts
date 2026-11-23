@@ -185,19 +185,32 @@ export function createVehicleRig(def: VehicleDef, overrideColor?: string): Vehic
     ? new THREE.MeshStandardMaterial({
         color: primary,
         transparent: true,
-        opacity: 0.22,
+        opacity: 0.42,
+        depthWrite: true,
+        depthTest: true,
+        side: THREE.FrontSide,
         wireframe: false,
         roughness: 0.1,
         metalness: 0.9
       })
     : new THREE.MeshStandardMaterial({
         color: primary,
+        transparent: false,
+        opacity: 1.0,
+        depthWrite: true,
+        depthTest: true,
+        side: THREE.FrontSide,
         metalness: def.category === 'creature' ? 0.1 : 0.55,
         roughness: def.category === 'creature' ? 0.8 : 0.32
       });
 
   const accentMat = new THREE.MeshStandardMaterial({
     color: def.accentColor,
+    transparent: false,
+    opacity: 1.0,
+    depthWrite: true,
+    depthTest: true,
+    side: THREE.FrontSide,
     metalness: 0.45,
     roughness: 0.35,
     emissive: def.isElectric || def.isSpecial ? new THREE.Color(def.accentColor) : new THREE.Color('#000000'),
@@ -208,11 +221,22 @@ export function createVehicleRig(def: VehicleDef, overrideColor?: string): Vehic
     color: '#0F172A',
     metalness: 0.85,
     roughness: 0.12,
-    transparent: true,
-    opacity: def.isInvisible ? 0.2 : 0.78
+    transparent: false,
+    opacity: 1.0,
+    depthWrite: true,
+    depthTest: true,
+    side: THREE.FrontSide
   });
 
-  const darkMat = new THREE.MeshStandardMaterial({ color: '#111827', roughness: 0.8 });
+  const darkMat = new THREE.MeshStandardMaterial({
+    color: '#111827',
+    roughness: 0.8,
+    transparent: false,
+    opacity: 1.0,
+    depthWrite: true,
+    depthTest: true,
+    side: THREE.FrontSide
+  });
   const headMat = new THREE.MeshBasicMaterial({ color: '#FEF08A' });
   const tailMat = new THREE.MeshBasicMaterial({ color: '#EF4444' });
   const flameMat = new THREE.MeshBasicMaterial({ color: def.isElectric ? '#00F0FF' : '#38BDF8' });
@@ -535,6 +559,7 @@ export function createVehicleRig(def: VehicleDef, overrideColor?: string): Vehic
     const isRickshaw = def.modelShape === 'rickshaw';
     const isTank = def.modelShape === 'tank';
     const isJcb = def.modelShape === 'jcb';
+    const isBus = def.modelShape === 'bus';
     const isTruck = def.modelShape === 'truck' || def.modelShape === 'truck_trailer' || def.modelShape === 'fire_truck';
     const isSuper = def.modelShape === 'supercar' || def.modelShape === 'hypercar';
     const isTractor = def.modelShape === 'tractor';
@@ -580,7 +605,7 @@ export function createVehicleRig(def: VehicleDef, overrideColor?: string): Vehic
     }
 
     const chassisY = def.wheelRadius + (def.modelShape === 'monster_truck' ? 0.35 : 0.14);
-    const bodyHeight = isSuper ? def.height * 0.42 : isTruck ? def.height * 0.58 : def.height * 0.46;
+    const bodyHeight = isBus ? def.height * 0.78 : isSuper ? def.height * 0.42 : isTruck ? def.height * 0.58 : def.height * 0.46;
 
     const base = new THREE.Mesh(
       new THREE.BoxGeometry(def.width * 0.94, bodyHeight, def.length * 0.96),
@@ -591,7 +616,28 @@ export function createVehicleRig(def: VehicleDef, overrideColor?: string): Vehic
     bodyGroup.add(base);
 
     // Cabin / Canopy
-    if (isTruck) {
+    if (isBus) {
+      const winBand = new THREE.Mesh(
+        new THREE.BoxGeometry(def.width * 0.96, bodyHeight * 0.34, def.length * 0.88),
+        glassMat
+      );
+      winBand.position.set(0, chassisY + bodyHeight * 0.68, 0.08);
+      bodyGroup.add(winBand);
+
+      const stripe = new THREE.Mesh(
+        new THREE.BoxGeometry(def.width * 0.97, 0.2, def.length * 0.94),
+        accentMat
+      );
+      stripe.position.set(0, chassisY + bodyHeight * 0.38, 0);
+      bodyGroup.add(stripe);
+
+      const frontGlass = new THREE.Mesh(
+        new THREE.BoxGeometry(def.width * 0.84, bodyHeight * 0.38, 0.14),
+        glassMat
+      );
+      frontGlass.position.set(0, chassisY + bodyHeight * 0.65, def.length * 0.48);
+      bodyGroup.add(frontGlass);
+    } else if (isTruck) {
       const cab = new THREE.Mesh(
         new THREE.BoxGeometry(def.width * 0.9, def.height * 0.38, def.length * 0.28),
         bodyMat

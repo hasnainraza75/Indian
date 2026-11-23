@@ -1,6 +1,8 @@
+import RAPIER from '@dimforge/rapier3d-compat';
 import * as THREE from 'three';
 import { VEHICLE_MAP } from '../data/vehiclesData';
 import { CharacterRig, createCharacterRig, createVehicleRig, VehicleRig } from '../entities/MeshFactory';
+import { PhysicsWorld } from '../physics/PhysicsWorld';
 import { WorldBuilder } from '../world/WorldBuilder';
 
 export interface PoliceChaser {
@@ -13,19 +15,26 @@ export interface PoliceChaser {
   fireCooldown: number;
   charRig?: CharacterRig;
   vehRig?: VehicleRig;
+  body?: RAPIER.RigidBody;
 }
 
 export class PoliceSystem {
   readonly scene: THREE.Scene;
   readonly units: PoliceChaser[] = [];
 
+  private physics: PhysicsWorld | null = null;
   wantedStars = 0;
   wantedCooldown = 0; // seconds until star decays
   bustedTimer = 0;
   private spawnTimer = 0;
 
-  constructor(scene: THREE.Scene) {
+  constructor(scene: THREE.Scene, physics?: PhysicsWorld) {
     this.scene = scene;
+    this.physics = physics ?? null;
+  }
+
+  setPhysicsWorld(physics: PhysicsWorld): void {
+    this.physics = physics;
   }
 
   addHeat(starsToAdd: number): void {
@@ -45,6 +54,7 @@ export class PoliceSystem {
     for (const u of this.units) {
       if (u.charRig) this.scene.remove(u.charRig.group);
       if (u.vehRig) this.scene.remove(u.vehRig.group);
+      if (u.body && this.physics) this.physics.removeBody(u.body);
     }
     this.units.length = 0;
   }
@@ -77,7 +87,6 @@ export class PoliceSystem {
       return;
     }
 
-    // Cooldown if player hides in safe zone or stays far from police
     const nearest = this.getNearestPoliceTelemetry(playerPos);
     if (playerInSafeZone || nearest.dist > 85) {
       this.wantedCooldown -= dt * (playerInSafeZone ? 2.5 : 1.0);
@@ -93,7 +102,6 @@ export class PoliceSystem {
       this.wantedCooldown = Math.max(this.wantedCooldown, 14);
     }
 
-    // Spawn pursuit units up to star cap
     const desiredCount = Math.min(7, this.wantedStars + 1);
     this.spawnTimer -= dt;
     if (this.units.length < desiredCount && this.spawnTimer <= 0) {
@@ -108,6 +116,7 @@ export class PoliceSystem {
       if (u.health <= 0) {
         if (u.charRig) this.scene.remove(u.charRig.group);
         if (u.vehRig) this.scene.remove(u.vehRig.group);
+        if (u.body && this.physics) this.physics.removeBody(u.body);
         this.units.splice(i, 1);
         continue;
       }
@@ -116,7 +125,6 @@ export class PoliceSystem {
       const dz = playerPos.z - u.pos.z;
       const dist = Math.hypot(dx, dz);
 
-      // Recycle overly distant unit
       if (dist > 175) {
         const ang = Math.random() * Math.PI * 2;
         u.pos.set(playerPos.x + Math.cos(ang) * 75, u.kind === 'heli' ? 28 : 0, playerPos.z + Math.sin(ang) * 75);
@@ -138,13 +146,24 @@ export class PoliceSystem {
         u.speed *= Math.max(0, 1 - dt * 4);
       }
 
-      u.pos.x += Math.sin(u.rotY) * u.speed * dt;
-      u.pos.z += Math.cos(u.rotY) * u.speed * dt;
+      const nextX = u.pos.x + Math.sin(u.rotY) * u.speed * dt;
+      const nextZ = u.pos.z + Math.cos(u.rotY) * u.speed * dt;
 
       if (u.kind === 'heli') {
+        u.pos.x = nextX;
+        u.pos.z = nextZ;
         u.pos.y = 26 + Math.sin(timeSec * 1.5) * 1.8;
       } else {
+        const radius = u.kind === 'officer' ? 0.5 : u.kind === 'bike' ? 0.9 : 1.55;
+        const height = u.kind === 'officer' ? 1.8 : 2.1;
+        const colRes = world.resolveHorizontalCollision(nextX, nextZ, u.pos.y, radius, height);
+        u.pos.x = colRes.x;
+        u.pos.z = colRes.z;
         u.pos.y = world.getGroundHeight(u.pos.x, u.pos.z, u.pos.y);
+      }
+
+      if (u.body && this.physics) {
+        this.physics.updateKinematicBody(u.body, u.pos.x, u.pos.y, u.pos.z, u.rotY);
       }
 
       if (u.charRig) {
@@ -168,7 +187,6 @@ export class PoliceSystem {
         }
       }
 
-      // Police attack & arrest check
       if (!playerInSafeZone && dist < (u.kind === 'heli' ? 48 : 26)) {
         u.fireCooldown -= dt;
         if (u.fireCooldown <= 0) {
@@ -215,10 +233,16 @@ export class PoliceSystem {
       this.units.push({ id, kind, pos: new THREE.Vector3(sx, sy, sz), rotY: 0, speed: 0, health: 90, fireCooldown: 1.0, charRig });
     } else {
       const defId = kind === 'heli' ? 'police_helicopter' : kind === 'bike' ? 'pulsar' : 'police_jeep';
-      const vehRig = createVehicleRig(VEHICLE_MAP[defId], kind === 'bike' ? '#1D4ED8' : undefined);
+      const def = VEHICLE_MAP[defId];
+      const vehRig = createVehicleRig(def, kind === 'bike' ? '#1D4ED8' : undefined);
       const startY = kind === 'heli' ? 28 : sy;
       vehRig.group.position.set(sx, startY, sz);
       this.scene.add(vehRig.group);
+      const body =
+        kind !== 'heli' && this.physics
+          ? this.physics.createKinematicTrafficBody(def.width, def.height, def.length, sx, startY, sz, 0)
+          : undefined;
+
       this.units.push({
         id,
         kind,
@@ -227,8 +251,10 @@ export class PoliceSystem {
         speed: 0,
         health: kind === 'heli' ? 260 : 180,
         fireCooldown: 1.2,
-        vehRig
+        vehRig,
+        body
       });
     }
   }
 }
+

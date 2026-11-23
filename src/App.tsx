@@ -36,6 +36,14 @@ const INITIAL_HUD: HudSnapshot = {
   isElectric: false,
   canFly: false,
   canFloat: false,
+  isHelicopter: false,
+  heliEngineOn: false,
+  heliRotorRpm: 0,
+  heliHover: false,
+  heliLanding: false,
+  altitudeM: 0,
+  airspeedKmh: 0,
+  cameraMode: 'third_person',
   nitroCharge: 100,
   nitroActive: false,
   activeWeapon: 'pistol',
@@ -90,7 +98,11 @@ export const App: React.FC = () => {
     });
     engineRef.current = engine;
 
-    const timer = window.setTimeout(() => setLoading(false), 550);
+    let cancelled = false;
+    const minSplash = new Promise((r) => window.setTimeout(r, 450));
+    Promise.all([engine.initPhysics(), minSplash]).then(() => {
+      if (!cancelled) setLoading(false);
+    });
 
     const onLifecycle = (e: Event) => {
       const detail = (e as CustomEvent<{ state: string }>).detail;
@@ -110,7 +122,7 @@ export const App: React.FC = () => {
     window.addEventListener('android-lifecycle', onLifecycle);
 
     return () => {
-      clearTimeout(timer);
+      cancelled = true;
       window.removeEventListener('android-lifecycle', onLifecycle);
       engine.dispose();
       engineRef.current = null;
@@ -201,6 +213,11 @@ export const App: React.FC = () => {
           onInput={(patch) => engine.setTouchInput(patch)}
           onCameraDrag={(dx, dy) => engine.addCameraDrag(dx, dy)}
           onCameraEnd={() => engine.endCameraDrag()}
+          onCycleCamera={() => engine.cycleCameraMode()}
+          onZoomCamera={(delta) => engine.adjustCameraZoom(delta)}
+          onToggleHeliEngine={() => engine.toggleHelicopterEngine()}
+          onToggleHeliHover={() => engine.toggleHelicopterHover()}
+          onTriggerHeliLand={() => engine.triggerHelicopterLand()}
           onEnterExit={() => engine.toggleEnterExitVehicle()}
           onHorn={() => engine.triggerHorn()}
           onReload={() => engine.triggerReload()}

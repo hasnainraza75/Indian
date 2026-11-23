@@ -4,7 +4,9 @@ import { MISSIONS } from './data/missionsData';
 import { PROPERTIES } from './data/propertiesData';
 import { VEHICLE_MAP } from './data/vehiclesData';
 import { WEAPON_ORDER, WEAPONS } from './data/weaponsData';
+import { PhysicsWorld } from './physics/PhysicsWorld';
 import {
+  CameraMode,
   CheatEntry,
   CheatFlagKey,
   GameScreen,
@@ -24,7 +26,7 @@ import { PlayerController, PlayerInputState } from './systems/PlayerController';
 import { PoliceSystem } from './systems/PoliceSystem';
 import { createNewGameSave, SaveSystem } from './systems/SaveSystem';
 import { TrafficAndNpcSystem } from './systems/TrafficAndNpcSystem';
-import { ActiveVehicle, VehicleInputState, VehicleSystem } from './systems/VehiclePhysics';
+import { ActiveVehicle, isHelicopterDef, VehicleInputState, VehicleSystem } from './systems/VehiclePhysics';
 import { WalletSystem } from './systems/WalletSystem';
 
 export interface ControlInputBridge {
@@ -42,6 +44,10 @@ export interface ControlInputBridge {
   nitro: boolean;
   ascend: boolean;
   descend: boolean;
+  heliCyclicX: number;
+  heliCyclicY: number;
+  heliYaw: number;
+  heliLand: boolean;
 }
 
 export class GameEngine {
@@ -49,6 +55,7 @@ export class GameEngine {
   private renderer: THREE.WebGLRenderer;
   private scene: THREE.Scene;
   private world: WorldBuilder;
+  private physics: PhysicsWorld | null = null;
   private cameraSystem: CameraSystem;
   private player: PlayerController;
   private vehicles: VehicleSystem;
@@ -71,6 +78,7 @@ export class GameEngine {
   private stuntBannerTimer = 0;
   private toast: HudSnapshot['toast'] = null;
   private toastTimer = 0;
+  private heliHintCooldown = 0;
   private missionResult: HudSnapshot['missionResult'] = null;
   private bustedOrWasted: HudSnapshot['bustedOrWasted'] = null;
   private duplicateCheatPrompt: HudSnapshot['duplicateCheatPrompt'] = null;
@@ -90,18 +98,25 @@ export class GameEngine {
     handbrake: false,
     nitro: false,
     ascend: false,
-    descend: false
+    descend: false,
+    heliCyclicX: 0,
+    heliCyclicY: 0,
+    heliYaw: 0,
+    heliLand: false
   };
   private cameraTouchDelta = { x: 0, y: 0, active: false };
 
   private rafId: number | null = null;
   private lastFrameMs = 0;
+  private physicsAccum = 0;
+  private readonly FIXED_DT = 1 / 60;
   private hudEmitAccum = 0;
   private autoSaveAccum = 0;
   private fpsCounter = 60;
   private fpsAccum = 0;
   private fpsFrames = 0;
   private elapsedSec = 0;
+  private disposed = false;
   private onHudUpdate: (snapshot: HudSnapshot) => void;
 
   constructor(container: HTMLElement, onHudUpdate: (snapshot: HudSnapshot) => void) {
@@ -151,6 +166,21 @@ export class GameEngine {
     this.startLoop();
   }
 
+  async initPhysics(): Promise<void> {
+    if (this.physics || this.disposed) return;
+    const physics = await PhysicsWorld.create(this.world);
+    if (this.disposed) {
+      physics.free();
+      return;
+    }
+    this.physics = physics;
+    this.player.attachPhysics(physics);
+    this.vehicles.setPhysicsWorld(physics);
+    this.trafficAndNpcs.setPhysicsWorld(physics);
+    this.police.setPhysicsWorld(physics);
+    this.cameraSystem.setPhysicsWorld(physics);
+  }
+
   private bindEvents(): void {
     window.addEventListener('resize', this.handleResize);
     window.addEventListener('keydown', this.handleKeyDown);
@@ -167,13 +197,23 @@ export class GameEngine {
   private handleKeyDown = (e: KeyboardEvent): void => {
     this.audio.initOnUserGesture();
     this.keys.add(e.code);
-    if (e.code === 'KeyF' && this.screen === 'playing') {
+    if (this.screen !== 'playing') return;
+
+    if (e.code === 'KeyF') {
       this.toggleEnterExitVehicle();
-    } else if (e.code === 'KeyR' && this.screen === 'playing') {
+    } else if (e.code === 'KeyC') {
+      this.cycleCameraMode();
+    } else if (e.code === 'KeyG' && this.activeVehicle?.isHelicopter) {
+      this.toggleHelicopterEngine();
+    } else if (e.code === 'KeyV' && this.activeVehicle?.isHelicopter) {
+      this.toggleHelicopterHover();
+    } else if (e.code === 'KeyL' && this.activeVehicle?.isHelicopter) {
+      this.triggerHelicopterLand();
+    } else if (e.code === 'KeyR' && !this.activeVehicle) {
       this.triggerReload();
-    } else if (e.code === 'KeyH' && this.screen === 'playing') {
+    } else if (e.code === 'KeyH') {
       this.triggerHorn();
-    } else if (e.code === 'KeyE' && this.screen === 'playing') {
+    } else if (e.code === 'KeyE' && !this.activeVehicle) {
       this.cycleWeapon();
     }
   };
@@ -192,11 +232,11 @@ export class GameEngine {
   }
 
   private applySaveToWorld(data: SaveData): void {
-    this.player.pos.set(data.playerPos.x, data.playerPos.y, data.playerPos.z);
+    const safeY = Math.max(data.playerPos.y, this.world.getGroundHeight(data.playerPos.x, data.playerPos.z, data.playerPos.y + 1));
+    this.player.setPosition(data.playerPos.x, safeY, data.playerPos.z);
     this.player.rotY = data.playerPos.rotY;
     this.player.health = data.health;
     this.player.armor = data.armor;
-    this.player.rig.group.position.copy(this.player.pos);
     this.player.rig.group.rotation.y = this.player.rotY;
 
     this.wallet.syncFromSave(data.money, data.transactions);
@@ -220,6 +260,44 @@ export class GameEngine {
     this.cameraTouchDelta.active = false;
   }
 
+  cycleCameraMode(): CameraMode {
+    const mode = this.cameraSystem.cycleMode();
+    const label = mode === 'first_person' ? 'FIRST PERSON VIEW' : mode === 'far' ? 'FAR CHASE VIEW' : '3RD PERSON VIEW';
+    this.showToast(`Camera: ${label}`, 'info');
+    this.emitHud();
+    return mode;
+  }
+
+  adjustCameraZoom(delta: number): void {
+    this.cameraSystem.adjustZoom(delta);
+  }
+
+  toggleHelicopterEngine(): void {
+    if (!this.activeVehicle?.isHelicopter) return;
+    const on = this.vehicles.toggleHelicopterEngine(this.activeVehicle);
+    if (on) {
+      this.audio.playEngineStart();
+      this.showToast('Helicopter Engine STARTED — Spooling Rotors', 'success');
+    } else {
+      this.showToast('Helicopter Engine SHUT DOWN', 'warning');
+    }
+    this.emitHud();
+  }
+
+  toggleHelicopterHover(): void {
+    if (!this.activeVehicle?.isHelicopter) return;
+    const hover = this.vehicles.toggleHelicopterHover(this.activeVehicle);
+    this.showToast(hover ? 'Auto-Hover LOCKED' : 'Auto-Hover OFF', 'info');
+    this.emitHud();
+  }
+
+  triggerHelicopterLand(): void {
+    if (!this.activeVehicle?.isHelicopter) return;
+    this.vehicles.triggerHelicopterLand(this.activeVehicle);
+    this.showToast('Auto-Landing Engaged', 'info');
+    this.emitHud();
+  }
+
   setScreen(screen: GameScreen): void {
     this.audio.initOnUserGesture();
     this.screen = screen;
@@ -236,7 +314,8 @@ export class GameEngine {
     const fresh = createNewGameSave(this.saveData.settings);
     this.saveData = fresh;
     this.activeVehicle = null;
-    this.player.inVehicle = false;
+    this.player.setInVehicle(false);
+    this.player.setVisible(true);
     this.police.clearHeat();
     this.missions.abortMission();
     this.vehicles.clearAll();
@@ -297,28 +376,38 @@ export class GameEngine {
       const v = this.activeVehicle;
       v.occupiedByPlayer = false;
       this.activeVehicle = null;
-      this.player.inVehicle = false;
-      this.player.pos.set(
-        v.pos.x + Math.cos(v.rotY) * (v.def.width * 0.75 + 0.8),
-        this.world.getGroundHeight(v.pos.x, v.pos.z, v.pos.y),
-        v.pos.z - Math.sin(v.rotY) * (v.def.width * 0.75 + 0.8)
-      );
-      this.player.vel.set(0, 0, 0);
+      this.player.setInVehicle(false);
+      this.player.setVisible(true);
+
+      const exitX = v.pos.x + Math.cos(v.rotY) * (v.def.width * 0.75 + 0.9);
+      const exitZ = v.pos.z - Math.sin(v.rotY) * (v.def.width * 0.75 + 0.9);
+      const exitY = v.isHelicopter && v.altitudeM > 2.5
+        ? v.pos.y
+        : this.world.getGroundHeight(exitX, exitZ, v.pos.y + 0.5);
+
+      this.player.setPosition(exitX, exitY, exitZ);
       this.showToast(`Exited ${v.def.name}`, 'info');
       this.emitHud();
       return;
     }
 
-    const nearest = this.vehicles.findNearestEnterable(this.player.pos, 4.6);
+    const nearest = this.vehicles.findNearestEnterable(this.player.pos, 4.8);
     if (nearest) {
       this.activeVehicle = nearest;
       nearest.occupiedByPlayer = true;
-      this.player.inVehicle = true;
-      this.audio.playEngineStart();
+      this.player.setInVehicle(true);
+      if (!nearest.isHelicopter) {
+        this.audio.playEngineStart();
+      }
       if (nearest.def.isPolice) {
         this.police.addHeat(1);
       }
-      this.showToast(`Entered ${nearest.def.name}`, 'info');
+      this.showToast(
+        nearest.isHelicopter
+          ? `Boarded ${nearest.def.name} — Press START ENG to fly`
+          : `Entered ${nearest.def.name}`,
+        'info'
+      );
       this.emitHud();
     }
   }
@@ -426,12 +515,11 @@ export class GameEngine {
     const prop = PROPERTIES.find((p) => p.id === propertyId);
     if (!prop) return { ok: false, msg: 'Property not found' };
     if (this.saveData.ownedProperties.includes(propertyId)) {
-      // Fast travel to owned property
       if (this.activeVehicle) {
-        this.activeVehicle.pos.set(prop.garageX, prop.y, prop.garageZ);
-        this.activeVehicle.speed = 0;
+        this.vehicles.teleportVehicle(this.activeVehicle, prop.garageX, prop.y + 0.15, prop.garageZ);
+        this.player.setPosition(prop.garageX, prop.y + 0.15, prop.garageZ);
       } else {
-        this.player.pos.set(prop.garageX, prop.y + 0.1, prop.garageZ);
+        this.player.setPosition(prop.garageX, prop.y + 0.15, prop.garageZ);
       }
       this.screen = 'playing';
       this.showToast(`Arrived at ${prop.name}`, 'info');
@@ -457,25 +545,25 @@ export class GameEngine {
     if (this.activeVehicle) {
       this.activeVehicle.occupiedByPlayer = false;
       this.activeVehicle = null;
-      this.player.inVehicle = false;
+      this.player.setInVehicle(false);
+      this.player.setVisible(true);
     }
 
-    this.player.pos.set(def.startX, def.startY + 0.2, def.startZ);
-    this.player.vel.set(0, 0, 0);
+    this.player.setPosition(def.startX, def.startY + 0.25, def.startZ);
 
     if (def.suggestedVehicleId) {
       const veh = this.vehicles.spawnVehicle(
         def.suggestedVehicleId,
         def.startX + 4.2,
-        this.world.getGroundHeight(def.startX + 4.2, def.startZ, 2),
+        this.world.getGroundHeight(def.startX + 4.2, def.startZ, 2) + 0.2,
         def.startZ,
         0
       );
       if (veh) {
         this.activeVehicle = veh;
         veh.occupiedByPlayer = true;
-        this.player.inVehicle = true;
-        this.audio.playEngineStart();
+        this.player.setInVehicle(true);
+        if (!veh.isHelicopter) this.audio.playEngineStart();
       }
     }
 
@@ -534,9 +622,10 @@ export class GameEngine {
         if (this.activeVehicle) {
           this.activeVehicle.occupiedByPlayer = false;
           this.activeVehicle = null;
-          this.player.inVehicle = false;
+          this.player.setInVehicle(false);
+          this.player.setVisible(true);
         }
-        this.player.pos.y = 95;
+        this.player.setPosition(this.player.pos.x, 95, this.player.pos.z);
         this.player.vel.set(0, -4, 0);
       },
       refuelAllVehicles: () => {
@@ -581,11 +670,12 @@ export class GameEngine {
 
   private spawnVehicleNearPlayer(vehicleId: string, _label: string, customColor?: string): ActiveVehicle | null {
     const yaw = this.activeVehicle ? this.activeVehicle.rotY : this.player.rotY;
-    const dist = 5.5;
+    const def = VEHICLE_MAP[vehicleId];
+    const dist = def && isHelicopterDef(def) ? 8.5 : 5.8;
     const sx = THREE.MathUtils.clamp(this.player.pos.x + Math.sin(yaw) * dist, -445, 445);
     const sz = THREE.MathUtils.clamp(this.player.pos.z + Math.cos(yaw) * dist, -445, 445);
-    const sy = this.world.getGroundHeight(sx, sz, this.player.pos.y + 2);
-    return this.vehicles.spawnVehicle(vehicleId, sx, sy + 0.4, sz, yaw, customColor);
+    const sy = this.world.getGroundHeight(sx, sz, this.player.pos.y + 3);
+    return this.vehicles.spawnVehicle(vehicleId, sx, sy + 0.35, sz, yaw, customColor);
   }
 
   private showToast(text: string, kind: NonNullable<HudSnapshot['toast']>['kind']): void {
@@ -611,7 +701,6 @@ export class GameEngine {
       }
 
       if (this.screen === 'main_menu') {
-        // Atmospheric flyover preview behind Main Menu
         this.elapsedSec += rawDt;
         const orbitAng = this.elapsedSec * 0.08;
         const camPos = new THREE.Vector3(Math.cos(orbitAng) * 145, 58, Math.sin(orbitAng) * 145);
@@ -635,12 +724,10 @@ export class GameEngine {
   private stepSimulation(dt: number, realDt: number): void {
     this.elapsedSec += dt;
 
-    // Advance 24h day-night cycle gently (~12 real minutes per 24h game day)
     if (!this.cheats.activeFlags.nightMode) {
       this.saveData.timeOfDay = (this.saveData.timeOfDay + dt * 0.032) % 24;
     }
 
-    // Dynamic random weather rotation
     this.weatherTimer -= realDt;
     if (this.weatherTimer <= 0) {
       this.weatherTimer = 85 + Math.random() * 65;
@@ -648,7 +735,6 @@ export class GameEngine {
       this.weather = pool[Math.floor(Math.random() * pool.length)];
     }
 
-    // Camera drag input
     let manualCam = false;
     if (Math.abs(this.cameraTouchDelta.x) > 0.01 || Math.abs(this.cameraTouchDelta.y) > 0.01) {
       this.cameraSystem.addInput(
@@ -661,57 +747,190 @@ export class GameEngine {
       manualCam = true;
     }
 
-    // Merge Keyboard + Touch inputs
-    const kbMoveX = (this.keys.has('KeyD') || this.keys.has('ArrowRight') ? 1 : 0) -
+    const kbMoveX =
+      (this.keys.has('KeyD') || this.keys.has('ArrowRight') ? 1 : 0) -
       (this.keys.has('KeyA') || this.keys.has('ArrowLeft') ? 1 : 0);
-    const kbMoveY = (this.keys.has('KeyW') || this.keys.has('ArrowUp') ? 1 : 0) -
+    const kbMoveY =
+      (this.keys.has('KeyW') || this.keys.has('ArrowUp') ? 1 : 0) -
       (this.keys.has('KeyS') || this.keys.has('ArrowDown') ? 1 : 0);
 
     const playerInSafeZone = this.isPlayerInSafeZone();
 
-    // Heal at Hospital safe zone
     if (Math.hypot(this.player.pos.x - this.world.zones.hospital.x, this.player.pos.z - this.world.zones.hospital.z) < 8) {
       this.player.health = Math.min(this.player.maxHealth, this.player.health + dt * 18);
     }
 
-    if (this.activeVehicle) {
-      const v = this.activeVehicle;
-      const vehInput: VehicleInputState = {
-        throttle: this.touchInput.throttle || this.keys.has('KeyW') || this.keys.has('ArrowUp'),
-        brakeReverse: this.touchInput.brakeReverse || this.keys.has('KeyS') || this.keys.has('ArrowDown'),
-        steer: Math.abs(this.touchInput.steer) > 0.05 ? this.touchInput.steer : kbMoveX,
-        handbrake: this.touchInput.handbrake || this.keys.has('Space'),
-        nitro: this.touchInput.nitro || this.keys.has('ShiftLeft') || this.keys.has('ShiftRight'),
-        ascend: this.touchInput.ascend || this.keys.has('KeyQ') || this.keys.has('Space'),
-        descend: this.touchInput.descend || this.keys.has('KeyZ') || this.keys.has('ControlLeft')
-      };
+    const onDamagePlayer = (dmg: number) => {
+      if (this.cheats.activeFlags.infinityHealth || playerInSafeZone) return;
+      this.player.applyDamage(dmg);
+      this.damageFlash = 0.65;
+      if (this.player.health <= 0) {
+        this.handleWastedOrBusted('wasted');
+      }
+    };
 
-      const prevAirborne = v.airborneTime;
-      this.vehicles.updatePlayerVehicle(v, dt, vehInput, this.world, this.elapsedSec, (sev) => {
-        this.audio.playCollision(sev);
-        this.cameraSystem.addShake(sev * 0.45);
-        SaveSystem.vibrate(Math.round(sev * 60), this.saveData.settings.controls.vibration);
-      });
+    const isAiming = this.touchInput.aim || this.keys.has('KeyK');
 
-      if (v.airborneTime > 0.25) {
-        this.missions.recordAirtime(dt);
-      } else if (prevAirborne > 1.1) {
-        const bonusCash = Math.round(prevAirborne * 150);
-        this.wallet.earn(bonusCash, 'Bike/Car Stunt Bonus');
-        this.stuntBanner = `STUNT AIRTIME ${prevAirborne.toFixed(1)}s  +$${bonusCash}`;
-        this.stuntBannerTimer = 2.8;
+    // Fixed Timestep Physics Accumulator (1/60s, max 3 substeps)
+    this.physicsAccum = Math.min(this.FIXED_DT * 3, this.physicsAccum + dt);
+    const subDt = this.physics ? this.FIXED_DT : dt;
+    const iterations = this.physics ? Math.floor(this.physicsAccum / this.FIXED_DT) : 1;
+    if (this.physics) {
+      this.physicsAccum -= iterations * this.FIXED_DT;
+    }
+
+    let lastVehInput: VehicleInputState | null = null;
+
+    for (let step = 0; step < Math.max(1, iterations); step++) {
+      // Sync animated doors with Rapier colliders
+      if (this.physics) {
+        for (const door of this.world.doors) {
+          this.physics.setDoorOpen(door.id, door.open);
+        }
       }
 
-      // Keep player synced inside vehicle seat
-      this.player.pos.copy(v.pos);
-      this.player.rotY = v.rotY;
-      this.player.rig.group.position.set(v.pos.x, v.pos.y + (v.def.category === 'motorcycle' ? 0.22 : 0.05), v.pos.z);
-      this.player.rig.group.rotation.y = v.rotY;
-      this.player.update(dt, { moveX: 0, moveY: 0, sprint: false, jumpPressed: false, crouchToggle: false }, this.cameraSystem.yaw, this.world, this.cheats.activeFlags, this.saveData.activeWeapon, false);
+      if (this.activeVehicle) {
+        const v = this.activeVehicle;
+        const vehInput: VehicleInputState = {
+          throttle: this.touchInput.throttle || this.keys.has('KeyW') || this.keys.has('ArrowUp'),
+          brakeReverse: this.touchInput.brakeReverse || this.keys.has('KeyS') || this.keys.has('ArrowDown'),
+          steer: Math.abs(this.touchInput.steer) > 0.05 ? this.touchInput.steer : kbMoveX,
+          handbrake: this.touchInput.handbrake || this.keys.has('Space'),
+          nitro: this.touchInput.nitro || this.keys.has('ShiftLeft') || this.keys.has('ShiftRight'),
+          ascend: this.touchInput.ascend || this.keys.has('KeyQ') || this.keys.has('Space'),
+          descend: this.touchInput.descend || this.keys.has('KeyZ') || this.keys.has('ControlLeft'),
+          heliCyclicX: Math.abs(this.touchInput.heliCyclicX) > 0.05
+            ? this.touchInput.heliCyclicX
+            : (this.keys.has('ArrowRight') ? 1 : 0) - (this.keys.has('ArrowLeft') ? 1 : 0),
+          heliCyclicY: Math.abs(this.touchInput.heliCyclicY) > 0.05
+            ? this.touchInput.heliCyclicY
+            : (this.keys.has('KeyW') || this.keys.has('ArrowUp') ? 1 : 0) -
+              (this.keys.has('KeyS') || this.keys.has('ArrowDown') ? 1 : 0),
+          heliYaw: Math.abs(this.touchInput.heliYaw) > 0.05
+            ? this.touchInput.heliYaw
+            : (this.keys.has('KeyD') ? 1 : 0) - (this.keys.has('KeyA') ? 1 : 0),
+          heliLand: this.touchInput.heliLand
+        };
+        this.touchInput.heliLand = false;
+        lastVehInput = vehInput;
 
-      this.audio.updateVehicleAudio(true, v.def.soundProfile, v.rpmNorm, vehInput.throttle, v.gear, v.skidIntensity);
+        if (v.isHelicopter && !v.heliEngineOn && vehInput.ascend && this.heliHintCooldown <= 0) {
+          this.heliHintCooldown = 2.5;
+          this.showToast('Tap ENG button (or G) to start helicopter engine!', 'warning');
+        }
 
-      // Tank / Apache firing when pressing Fire inside combat vehicle
+        const prevVel = v.vel.clone();
+        const prevAirborne = v.airborneTime;
+        this.vehicles.prepareVehiclePhysicsStep(v, subDt, vehInput, this.world);
+        this.vehicles.stepUnmannedVehicles(subDt, this.world);
+
+        this.trafficAndNpcs.update(subDt, this.player.pos, this.world, playerInSafeZone, onDamagePlayer);
+        this.police.update(
+          subDt,
+          this.player.pos,
+          v.speed,
+          playerInSafeZone,
+          this.world,
+          this.elapsedSec,
+          onDamagePlayer,
+          () => this.handleWastedOrBusted('busted')
+        );
+
+        if (this.physics) {
+          this.physics.step(subDt);
+        }
+
+        this.vehicles.syncPostPhysicsStep(v, subDt, prevVel, vehInput, this.world, this.elapsedSec, (sev) => {
+          this.audio.playCollision(sev);
+          this.cameraSystem.addShake(sev * 0.45);
+          SaveSystem.vibrate(Math.round(sev * 60), this.saveData.settings.controls.vibration);
+        });
+
+        if (!v.isHelicopter && !v.def.canFly) {
+          if (v.airborneTime > 0.25) {
+            this.missions.recordAirtime(subDt);
+          } else if (prevAirborne > 1.1) {
+            const bonusCash = Math.round(prevAirborne * 150);
+            this.wallet.earn(bonusCash, 'Bike/Car Stunt Bonus');
+            this.stuntBanner = `STUNT AIRTIME ${prevAirborne.toFixed(1)}s  +$${bonusCash}`;
+            this.stuntBannerTimer = 2.8;
+          }
+        }
+
+        this.player.pos.copy(v.pos);
+        this.player.rotY = v.rotY;
+        const isFirstPerson = this.cameraSystem.mode === 'first_person';
+        this.player.setVisible(!isFirstPerson);
+        this.player.rig.group.position.set(
+          v.pos.x,
+          v.pos.y + (v.def.category === 'motorcycle' ? 0.22 : 0.05),
+          v.pos.z
+        );
+        this.player.rig.group.rotation.y = v.rotY;
+        this.player.update(
+          subDt,
+          { moveX: 0, moveY: 0, sprint: false, jumpPressed: false, crouchToggle: false },
+          this.cameraSystem.yaw,
+          this.world,
+          this.cheats.activeFlags,
+          this.saveData.activeWeapon,
+          false
+        );
+      } else {
+        const pInput: PlayerInputState = {
+          moveX: Math.abs(this.touchInput.moveX) > 0.05 ? this.touchInput.moveX : kbMoveX,
+          moveY: Math.abs(this.touchInput.moveY) > 0.05 ? this.touchInput.moveY : kbMoveY,
+          sprint: this.touchInput.sprint || this.keys.has('ShiftLeft'),
+          jumpPressed: this.touchInput.jump || this.keys.has('Space'),
+          crouchToggle: this.touchInput.crouch
+        };
+        this.touchInput.crouch = false;
+        this.touchInput.jump = false;
+
+        this.player.setVisible(this.cameraSystem.mode !== 'first_person');
+        this.player.update(
+          subDt,
+          pInput,
+          this.cameraSystem.yaw,
+          this.world,
+          this.cheats.activeFlags,
+          this.saveData.activeWeapon,
+          isAiming
+        );
+        this.vehicles.stepUnmannedVehicles(subDt, this.world);
+        this.trafficAndNpcs.update(subDt, this.player.pos, this.world, playerInSafeZone, onDamagePlayer);
+        const pSpeed = Math.hypot(this.player.vel.x, this.player.vel.z);
+        this.police.update(
+          subDt,
+          this.player.pos,
+          pSpeed,
+          playerInSafeZone,
+          this.world,
+          this.elapsedSec,
+          onDamagePlayer,
+          () => this.handleWastedOrBusted('busted')
+        );
+
+        if (this.physics) {
+          this.physics.step(subDt);
+        }
+      }
+    }
+
+    // Audio & Combat (per render frame)
+    if (this.activeVehicle) {
+      const v = this.activeVehicle;
+      const throttleOn = lastVehInput?.throttle || v.heliEngineOn || false;
+      this.audio.updateVehicleAudio(
+        true,
+        v.def.soundProfile,
+        v.rpmNorm,
+        throttleOn,
+        v.gear,
+        v.skidIntensity,
+        v.heliRotorRpm
+      );
+
       if ((this.touchInput.fire || this.keys.has('KeyJ')) && (v.def.id === 'tank' || v.def.id === 'apache')) {
         this.combat.tryFire(
           'launcher',
@@ -741,29 +960,7 @@ export class GameEngine {
         );
       }
     } else {
-      const pInput: PlayerInputState = {
-        moveX: Math.abs(this.touchInput.moveX) > 0.05 ? this.touchInput.moveX : kbMoveX,
-        moveY: Math.abs(this.touchInput.moveY) > 0.05 ? this.touchInput.moveY : kbMoveY,
-        sprint: this.touchInput.sprint || this.keys.has('ShiftLeft'),
-        jumpPressed: this.touchInput.jump || this.keys.has('Space'),
-        crouchToggle: this.touchInput.crouch
-      };
-      this.touchInput.crouch = false;
-      this.touchInput.jump = false;
-
-      const isAiming = this.touchInput.aim || this.keys.has('KeyK');
-      this.player.update(
-        dt,
-        pInput,
-        this.cameraSystem.yaw,
-        this.world,
-        this.cheats.activeFlags,
-        this.saveData.activeWeapon,
-        isAiming
-      );
-      this.audio.updateVehicleAudio(false, 'silent', 0, false, 1, 0);
-
-      // Firing weapon
+      this.audio.updateVehicleAudio(false, 'silent', 0, false, 1, 0, 0);
       const wId = this.saveData.activeWeapon;
       this.combat.update(dt, wId, this.saveData.weapons[wId]);
       if (this.touchInput.fire || this.keys.has('KeyJ')) {
@@ -800,38 +997,13 @@ export class GameEngine {
       }
     }
 
-    // Update World, Traffic/NPCs, Police, Missions
     this.world.update(dt, this.saveData.timeOfDay, this.weather, this.player.pos, () => {
       this.audio.playThunder();
     });
 
-    const onDamagePlayer = (dmg: number) => {
-      if (this.cheats.activeFlags.infinityHealth || playerInSafeZone) return;
-      this.player.applyDamage(dmg);
-      this.damageFlash = 0.65;
-      if (this.player.health <= 0) {
-        this.handleWastedOrBusted('wasted');
-      }
-    };
-
-    this.trafficAndNpcs.update(dt, this.player.pos, this.world, playerInSafeZone, onDamagePlayer);
-
-    const playerSpeedMs = this.activeVehicle ? this.activeVehicle.speed : Math.hypot(this.player.vel.x, this.player.vel.z);
-    this.police.update(
-      dt,
-      this.player.pos,
-      playerSpeedMs,
-      playerInSafeZone,
-      this.world,
-      this.elapsedSec,
-      onDamagePlayer,
-      () => this.handleWastedOrBusted('busted')
-    );
-
     const nearPolice = this.police.getNearestPoliceTelemetry(this.player.pos);
     this.audio.updateEnvironmentAudio(this.weather, nearPolice.dist, nearPolice.relSpeed, this.elapsedSec);
 
-    // Check mission progress
     const mRes = this.missions.update(dt, this.player.pos, this.police.wantedStars);
     if (mRes.status === 'completed') {
       this.wallet.earn(mRes.reward + mRes.bonus, `Mission: ${mRes.title}`);
@@ -857,7 +1029,6 @@ export class GameEngine {
       };
     }
 
-    // Update Camera
     const isIndoors =
       this.player.pos.x >= -156 &&
       this.player.pos.x <= -134 &&
@@ -866,19 +1037,21 @@ export class GameEngine {
       this.player.pos.y < 4.2;
 
     this.cameraSystem.update(
-      dt,
+      realDt,
       this.player.pos,
       this.activeVehicle ? this.activeVehicle.rotY : this.player.rotY,
       Boolean(this.activeVehicle),
+      Boolean(this.activeVehicle?.isHelicopter),
       this.activeVehicle ? this.activeVehicle.def.length : 1,
+      this.activeVehicle ? this.activeVehicle.def.height : 1.75,
       this.activeVehicle ? Math.abs(this.activeVehicle.speed) * 3.6 : 0,
-      this.touchInput.aim || this.keys.has('KeyK'),
+      isAiming,
       Boolean(this.activeVehicle?.nitroActive),
       isIndoors,
       manualCam || this.cameraTouchDelta.active
     );
 
-    // Timers & Auto-save
+    if (this.heliHintCooldown > 0) this.heliHintCooldown = Math.max(0, this.heliHintCooldown - realDt);
     if (this.damageFlash > 0) this.damageFlash = Math.max(0, this.damageFlash - realDt * 2.2);
     if (this.toastTimer > 0) {
       this.toastTimer -= realDt;
@@ -913,15 +1086,15 @@ export class GameEngine {
     if (this.activeVehicle) {
       this.activeVehicle.occupiedByPlayer = false;
       this.activeVehicle = null;
-      this.player.inVehicle = false;
+      this.player.setInVehicle(false);
+      this.player.setVisible(true);
     }
     if (this.missions.activeDef) {
       this.missions.abortMission();
     }
 
     const spawn = kind === 'busted' ? this.world.zones.policeStation : this.world.zones.hospital;
-    this.player.pos.set(spawn.x, 0.2, spawn.z + 14);
-    this.player.vel.set(0, 0, 0);
+    this.player.setPosition(spawn.x, 0.25, spawn.z + 14);
     this.player.health = this.player.maxHealth;
     this.player.armor = 25;
     this.bustedOrWasted = { kind, fine };
@@ -950,7 +1123,7 @@ export class GameEngine {
     const wDef = WEAPONS[wId];
     const wInv = this.saveData.weapons[wId];
 
-    const nearbyVeh = !this.activeVehicle ? this.vehicles.findNearestEnterable(this.player.pos, 4.6) : null;
+    const nearbyVeh = !this.activeVehicle ? this.vehicles.findNearestEnterable(this.player.pos, 4.8) : null;
     const nearbyDoor = this.world.doors.find((d) => Math.hypot(this.player.pos.x - d.x, this.player.pos.z - d.z) < 4.5);
     const nearbyPump = this.world.zones.petrolPumps.some(
       (p) => Math.hypot(this.player.pos.x - p.x, this.player.pos.z - p.z) < p.radius
@@ -1038,6 +1211,14 @@ export class GameEngine {
       isElectric: Boolean(this.activeVehicle?.def.isElectric),
       canFly: Boolean(this.activeVehicle?.def.canFly),
       canFloat: Boolean(this.activeVehicle?.def.canFloat),
+      isHelicopter: Boolean(this.activeVehicle?.isHelicopter),
+      heliEngineOn: Boolean(this.activeVehicle?.heliEngineOn),
+      heliRotorRpm: this.activeVehicle?.heliRotorRpm ?? 0,
+      heliHover: Boolean(this.activeVehicle?.heliHover),
+      heliLanding: Boolean(this.activeVehicle?.heliAutoLanding),
+      altitudeM: this.activeVehicle ? Math.round(this.activeVehicle.altitudeM) : 0,
+      airspeedKmh: this.activeVehicle ? Math.round(this.activeVehicle.airspeedMs * 3.6) : 0,
+      cameraMode: this.cameraSystem.mode,
       nitroCharge: this.activeVehicle ? Math.round(this.activeVehicle.nitroCharge) : 100,
       nitroActive: Boolean(this.activeVehicle?.nitroActive),
       activeWeapon: wId,
@@ -1084,10 +1265,13 @@ export class GameEngine {
   }
 
   dispose(): void {
+    this.disposed = true;
     if (this.rafId !== null) cancelAnimationFrame(this.rafId);
     window.removeEventListener('resize', this.handleResize);
     window.removeEventListener('keydown', this.handleKeyDown);
     window.removeEventListener('keyup', this.handleKeyUp);
+    this.physics?.free();
+    this.physics = null;
     this.audio.dispose();
     this.renderer.dispose();
     if (this.renderer.domElement.parentElement === this.container) {
@@ -1095,3 +1279,4 @@ export class GameEngine {
     }
   }
 }
+

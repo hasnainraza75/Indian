@@ -78,6 +78,7 @@ export type VehicleModelShape =
   | 'truck'
   | 'truck_trailer'
   | 'fire_truck'
+  | 'bus'
   | 'tractor'
   | 'jcb'
   | 'tank'
@@ -96,6 +97,8 @@ export type VehicleModelShape =
   | 'dinosaur'
   | 'quadruped'
   | 'robot_ai';
+
+export type CameraMode = 'third_person' | 'far' | 'first_person';
 
 export interface VehicleDef {
   id: string;
@@ -330,7 +333,15 @@ export interface HudSnapshot {
   vehicleMaxHealth: number;
   isElectric: boolean;
   canFly: boolean;
+  isHelicopter: boolean;
   canFloat: boolean;
+  heliEngineOn: boolean;
+  heliRotorRpm: number;
+  heliHover: boolean;
+  heliLanding: boolean;
+  altitudeM: number;
+  airspeedKmh: number;
+  cameraMode: CameraMode;
   nitroCharge: number;
   nitroActive: boolean;
   activeWeapon: WeaponId;
