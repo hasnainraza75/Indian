@@ -1,0 +1,6 @@
+{
+  "name": "Indian Open World 3D",
+  "description": "3D open-world action driving game featuring Indian cities, villages, highways, 60+ vehicles, luxury houses, police chases, missions, and mobile cheat codes.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
